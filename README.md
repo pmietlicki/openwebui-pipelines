@@ -21,33 +21,27 @@ Une implémentation personnalisée de RAG (Retrieval Augmented Generation) utili
 
 ## Variables d'environnement
 
-```bash
-# Configuration de base
-PIPELINE_TITLE="Custom RAG Pipeline"
-VECTOR_INDEX_DIR="/app/pipelines"
-DOCS_DIR="/app/pipelines/docs"
-DOCS_ROOT_DIR="/app/pipelines/docs"
-FILES_HOST="https://sourcefiles.test.local"
-
-# Paramètres de performance
-MAX_LOADERS=${CPU_COUNT}*4
-EMBED_DIM=1024
-BATCH_SIZE=5000
-
-# Paramètres FAISS
-HNSW_M=32
-HNSW_EF_CONS=100
-HNSW_EF_SEARCH=64
-
-# Paramètres de chunking
-MIN_CHUNK_LENGTH=50
-MAX_TOKENS=2048
-
-# Paramètres de retry
-CHAT_MAX_RETRIES=5
-CHAT_BACKOFF=1.0
-CHAT_MAX_PARALLEL=2
-```
+| Variable           | Description                                                        | Valeur par défaut                          |
+|--------------------|--------------------------------------------------------------------|--------------------------------------------|
+| PIPELINE_TITLE     | Titre du pipeline (transformé en slug)                             | Custom RAG Pipeline                        |
+| VECTOR_INDEX_DIR   | Répertoire pour l’index FAISS persistant                           | /app/pipelines                             |
+| DOCS_DIR           | Répertoire des documents source                                    | /app/pipelines/docs                        |
+| DOCS_ROOT_DIR      | Racine pour génération des URL de sources                          | /app/pipelines/docs                        |
+| FILES_HOST         | Hôte des fichiers pour liens                                        | https://sourcefiles.test.local             |
+| MAX_LOADERS        | Nombre maximal de threads de chargement                            | CPU_COUNT × 4                              |
+| EMBED_DIM          | Dimension des embeddings                                            | 1024                                       |
+| BATCH_SIZE         | Taille du batch pour l’indexation                                  | 5000                                       |
+| HNSW_M             | Paramètre M pour HNSW (nombre de voisins)                          | 32                                         |
+| HNSW_EF_CONS       | Paramètre efConstruction pour HNSW                                 | 100                                        |
+| HNSW_EF_SEARCH     | Paramètre efSearch pour HNSW                                       | 64                                         |
+| MIN_CHUNK_LENGTH   | Longueur minimale d’un chunk en caractères                         | 50                                         |
+| MAX_TOKENS         | Nombre maximum de tokens pour l’appel LLM                          | 2048                                       |
+| CHAT_MAX_RETRIES   | Nombre maximal de tentatives de retry pour le chat                 | 5                                          |
+| CHAT_BACKOFF       | Backoff exponentiel initial (en secondes)                          | 1.0                                        |
+| CHAT_MAX_PARALLEL  | Nombre maximal de requêtes chat parallèles                         | 2                                          |
+| SIM_THRESHOLD      | Seuil de similarité pour arrêt de la récupération (0.0–1.0)        | 0.75                                       |
+| BASE_TOP_K         | Pas de top_k initial pour la récupération adaptative               | 5                                          |
+| MAX_TOP_K          | Top_k maximal pour la récupération adaptative                      | 15                                         |
 
 ## Fonctionnalités principales
 
