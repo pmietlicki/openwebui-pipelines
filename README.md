@@ -19,6 +19,18 @@ Une implémentation personnalisée de RAG (Retrieval Augmented Generation) utili
 - faiss-cpu
 - Llama-Index core
 
+## Installation
+
+```bash
+pip install   llama-index   llama-index-embeddings-mistralai   llama-index-vector-stores-faiss   llama-index-readers-file>=0.4.0,<0.5.0   llama-index-llms-mistralai   pymupdf   pandas   beautifulsoup4   openpyxl   xlrd   python-pptx   docx2txt>=0.9.0   unstructured   mistralai>=1.0.0,<2.0.0   torch>=2.6.0   transformers>=4.51.3   safetensors>=0.5.3   huggingface_hub[hf_xet]>=0.30.2   faiss-cpu==1.11.0   Pillow>=11.0.0   requests>=2.28.0
+```
+
+Ou, si vous avez un `requirements.txt` dans votre dépôt :
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Variables d'environnement
 
 | Variable           | Description                                                        | Valeur par défaut                          |
@@ -42,6 +54,12 @@ Une implémentation personnalisée de RAG (Retrieval Augmented Generation) utili
 | SIM_THRESHOLD      | Seuil de similarité pour arrêt de la récupération (0.0–1.0)        | 0.75                                       |
 | BASE_TOP_K         | Pas de top_k initial pour la récupération adaptative               | 5                                          |
 | MAX_TOP_K          | Top_k maximal pour la récupération adaptative                      | 15                                         |
+
+## Optimisations avancées
+
+- Ajustement des paramètres HNSW (`HNSW_M`, `HNSW_EF_CONS`, `HNSW_EF_SEARCH`) pour performance vs précision.  
+- Réglage de `BASE_TOP_K` et `MAX_TOP_K` pour la stratégie de récupération adaptative.  
+- Taille de batch (`BATCH_SIZE`) ajustable selon volume de données.
 
 ## Fonctionnalités principales
 
