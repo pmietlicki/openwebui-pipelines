@@ -358,7 +358,7 @@ class Pipeline:
 
     def _scan_docs(self) -> dict:
         out = {}
-        for root, _, files in os.walk(self.docs_dir):
+        for root, _, files in os.walk(self.docs_dir, followlinks=True):
             for fn in files:
                 ext = os.path.splitext(fn)[1].lower()
                 if ext in EXTENSIONS:
@@ -630,7 +630,7 @@ class Pipeline:
 
             # 3.1) lister fichiers
             files = []
-            for r, _, fs in os.walk(self.docs_dir):
+            for r, _, fs in os.walk(self.docs_dir, followlinks=True):
                 for fn in fs:
                     ext = os.path.splitext(fn)[1].lower()
                     if ext in EXTENSIONS:
