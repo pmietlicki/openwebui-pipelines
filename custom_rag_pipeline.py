@@ -492,6 +492,12 @@ class Pipeline:
     async def on_startup(self) -> None:
         logger.info("🚀 Démarrage pipeline RAG")
 
+        # ─── FORCE_INITIAL ────────────────────────────────────────────────────────
+        force_initial = os.getenv("FORCE_INITIAL", "false").lower() in ("1", "true", "yes")
+        if force_initial:
+            logger.info("🔄 Force initial indexation demandée via FORCE_INITIAL")
+        # ───────────────────────────────────────────────────────────────────────────
+
         # 1) ThreadPool pour le parsing
         loop     = asyncio.get_running_loop()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_LOADERS)
@@ -516,8 +522,8 @@ class Pipeline:
 
         os.makedirs(self.persist_dir, exist_ok=True)
 
-        old_meta = self._load_meta()
-        file_exists = os.path.exists(self.meta_path)
+        old_meta = {} if force_initial else self._load_meta()
+        file_exists = False if force_initial else os.path.exists(self.meta_path)
 
         # Si metadata.json vide ou inexistant, mais l'index existe :
         if (not old_meta) and os.path.exists(os.path.join(self.persist_dir, "docstore.json")):
