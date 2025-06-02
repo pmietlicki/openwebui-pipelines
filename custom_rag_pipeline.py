@@ -8,6 +8,11 @@ import unicodedata
 from typing import List, Generator
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from sentence_transformers import SentenceTransformer
+from functools import lru_cache
+from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 
 title = os.getenv("PIPELINE_TITLE", "Custom RAG Pipeline")
 version = "1.0.0"
@@ -55,12 +60,14 @@ from llama_index.core.storage.index_store.simple_index_store import SimpleIndexS
 
 
 from llama_index.core.prompts import PromptTemplate
-from llama_index.core.postprocessor import SimilarityPostprocessor
+from llama_index.core.postprocessor import SimilarityPostprocessor, TimeWeightedPostprocessor
 from llama_index.core.llms import LLM as BaseLLM
 
 from llama_index.core.chat_engine import CondenseQuestionChatEngine
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.llms import ChatMessage
+from llama_index.core.readers.base import BaseReader
+from llama_index.core.schema import Document
 
 # ─── Nouveau parser pour chunking ─────────────────────────────────────────────
 from llama_index.core.node_parser import TokenTextSplitter
@@ -107,11 +114,13 @@ from pydantic import Field, PrivateAttr
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logger = logging.getLogger("custom_rag_pipeline")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("llama_index").setLevel(logging.INFO)
 
 # ─── Concurrence & extensions autorisées ──────────────────────────────────────
 CPU_COUNT   = os.cpu_count() or 1
-EXTENSIONS  = {".pdf", ".docx", ".txt", ".md", ".html", ".csv", ".xlsx", ".xls", ".xlsm", ".pptx"}
+EXTENSIONS  = {".pdf", ".json", ".docx", ".txt", ".md", ".html", ".csv", ".xlsx", ".xls", ".xlsm", ".pptx"}
 FILES_HOST = os.getenv("FILES_HOST", "https://sourcefiles.test.local")
+AFFICHAGE_SOURCES = os.getenv("AFFICHAGE_SOURCES", "false").lower() in ("1", "true", "yes")
 MAX_LOADERS = int(os.getenv("MAX_LOADERS", CPU_COUNT * 4))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE", "5000"))
@@ -128,6 +137,20 @@ CHAT_MAX_PARALLEL  = int(os.getenv("CHAT_MAX_PARALLEL", 2))
 SIM_THRESHOLD = 0.75          # seuil “pertinent”
 MAX_TOP_K     = 15            # plafond
 BASE_TOP_K    = 5 
+
+class ConfluenceJSONReader(BaseReader):
+    def load_data(self, file_path: str):
+        obj   = json.load(open(file_path, encoding="utf-8"))
+        meta  = {k: obj[k] for k in ("url","space","title","last_modified","pdf_filename") if k in obj}
+        meta["file_path"] = file_path
+
+        # 1) Extraire et nettoyer le HTML
+        soup = BeautifulSoup(obj.get("html", ""), "html.parser")
+        body = soup.get_text(separator="\n")
+
+        # 2) Préfacer avec le titre
+        text = f"{obj.get('title','')}\n\n{body}"
+        return [Document(text=text, metadata=meta)]
 
 # ─── Embedding avec back-off ──────────────────────────────────────────────────
 class RetryingMistralEmbedding(MistralAIEmbedding):
@@ -236,9 +259,12 @@ class RetryingLLM(CustomLLM):
 # ─── Chunking parallèle (fonction au module) ─────────────────────────────────
 def _chunk_batch(docs_batch):
     for doc in docs_batch:
-        doc.metadata = {"file_path": doc.metadata.get("file_path", "")}
+        # garantit seulement la présence de file_path
+        if doc.metadata is None:
+            doc.metadata = {}
+        doc.metadata.setdefault("file_path", "")
     splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=64, include_metadata=True)
-    return splitter.get_nodes_from_documents(docs_batch, show_progress=False)
+    return splitter.get_nodes_from_documents(docs_batch, show_progress=True)
 
 # ── helper pour échapper les caractères spéciaux Markdown ──────────────
 _MD_SPECIALS = re.compile(r'([\\`*_{}\[\]()#+\-.!>])')
@@ -266,6 +292,26 @@ def _render_sources(raw: str, docs_root: str, host: str) -> str:
         out.append(f"- {md_escape(texte)}")
     return "\n".join(out)
 
+# utilitaire : racourci + échappement
+def _excerpt(text: str, max_sent=2, max_chars=220):
+    sent = " ".join(re.split(r'(?<=[.!?])\s+', text)[:max_sent]).strip()
+    if len(sent) > max_chars:
+        sent = sent[:max_chars].rsplit(" ", 1)[0] + "…"
+    return sent
+
+def _format_sources(nodes, max_sent=2):
+    """Bullet list propre + dé-duplication par fichier."""
+    seen, out = set(), []
+    for nws in nodes:
+        fp = Path(nws.node.metadata.get("file_path", ""))
+        if fp in seen:                                 # évite les doublons
+            continue
+        seen.add(fp)
+        txt = _excerpt(nws.node.text)
+        out.append(f"- **{md_escape(fp.name)}**  \n  > {md_escape(txt)}")
+    return "\n".join(out)
+
+
 def _group_sources(source_nodes):
     """
     Regroupe les chunks par fichier et renvoie
@@ -278,24 +324,110 @@ def _group_sources(source_nodes):
         files.setdefault(fp, []).append(node.node_id)
     return files
 
-def _sources_markdown(files_by_path: dict[str, list[str]], docs_root: str) -> str:
+# --------------------------------------------------------------------------- #
+#  UTILITAIRE : mapping pdf_filename → url Confluence (mis en cache)
+# --------------------------------------------------------------------------- #
+def _get_pages_dir(docs_root: str | Path) -> Path:
     """
-    Rend la section Markdown “Sources” sans afficher les node_ids.
+    Retourne <docs_root>/pages s’il existe,
+    sinon <docs_root> lui-même.
     """
-    if not files_by_path:
-        return ""                   # pas de sources → rien à ajouter
+    docs_root = Path(docs_root)
+    pages_dir = docs_root / "pages"
+    return pages_dir if pages_dir.is_dir() else docs_root
 
-    lines = ["\n\n---\n### Fichiers sources\n"]
-    for i, fp in enumerate(files_by_path.keys(), 1):
+@lru_cache(maxsize=1)
+def _pdf_url_map(docs_root: str) -> dict[str, str]:
+    """
+    Balayage unique du dossier *pages* (ou docs_root) pour
+    construire {pdf_filename: url_confluence}.
+    """
+    pages_dir = _get_pages_dir(docs_root)
+    mapping = {}
+    for p in pages_dir.rglob("*.json"):
         try:
-            rel = Path(fp).relative_to(docs_root)
-        except ValueError:
-            # fp hors de docs_root : on garde le chemin absolu
-            rel = Path(fp)
-        name = rel.name or fp
-        url  = f"{FILES_HOST}/{quote(str(rel))}"
-        lines.append(f"{i}. [{name}]({url})")
-    return "\n".join(lines)
+            data = json.load(p.open(encoding="utf-8"))
+            if (pdf := data.get("pdf_filename")) and (url := data.get("url")):
+                mapping[pdf] = url
+        except Exception:
+            pass           # JSON corrompu ≫ ignoré
+    return mapping
+
+# ─── markdown des sources (gère le cas PDF) ───────────────────────────────────
+def _sources_markdown(
+    files_by_path: dict[str, list[str]],
+    docs_root: str,
+    files_host: str = FILES_HOST,
+) -> str:
+    if not files_by_path:
+        return ""
+
+    pdf_map = _pdf_url_map(docs_root)     # cache mémoïsé
+    out = ["\n\n---\n### Liens\n"]
+
+    for i, fp in enumerate(files_by_path, 1):
+        p = Path(fp)
+        url = None
+
+        if p.suffix.lower() == ".json":
+            try:
+                url = json.load(p.open(encoding="utf-8")).get("url")
+            except Exception:
+                pass
+        elif p.suffix.lower() == ".pdf":
+            url = pdf_map.get(p.name)
+
+        if not url:
+            try:
+                rel = p.relative_to(docs_root)
+            except ValueError:
+                rel = p
+            url = f"{files_host}/{quote(str(rel))}"
+
+        out.append(f"{i}. [{p.name}]({url})")
+
+    return "\n".join(out)
+
+def _content_to_text(content) -> str:
+    """
+    Convertit le champ 'content' OpenAI (str ou liste de blocs)
+    en texte brut exploitable par ChatMessage / Mistral.
+    - Les blocs textuels sont concaténés.
+    - Les images sont ignorées (ou remplacez-les par un placeholder).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if blk.get("type") == "text":
+                parts.append(blk.get("text", ""))
+            # Optionnel : garder une trace visuelle des images
+            # elif blk.get("type") == "image_url":
+            #     parts.append("[IMAGE]")
+        return "\n".join(parts).strip()
+    return str(content)
+
+def _content_to_text(content) -> str:
+    """
+    Convertit le champ 'content' OpenAI (str ou liste de blocs)
+    en texte brut exploitable par ChatMessage / Mistral.
+    - Les blocs textuels sont concaténés.
+    - Les images sont ignorées (ou remplacez-les par un placeholder).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if blk.get("type") == "text":
+                parts.append(blk.get("text", ""))
+            # Optionnel : garder une trace visuelle des images
+            # elif blk.get("type") == "image_url":
+            #     parts.append("[IMAGE]")
+        return "\n".join(parts).strip()
+    return str(content)
+
 
 class NoCondenseChatEngine(CondenseQuestionChatEngine):
     """Historique conservé, question transmise telle quelle (sync + async)."""
@@ -312,6 +444,7 @@ class Pipeline:
         self.name = title
         self.version = version
         self.author = author
+        self.model = os.getenv("EMBED_MODEL_TYPE", "mistral").lower()
         self.persist_dir = os.getenv("VECTOR_INDEX_DIR", "/app/pipelines")
         self.docs_dir    = os.getenv("DOCS_DIR",        "/app/pipelines/docs")
         self.doc_root_dir = os.getenv("DOCS_ROOT_DIR",   "/app/pipelines/docs")
@@ -320,6 +453,8 @@ class Pipeline:
         self.index: VectorStoreIndex | None = None
         self.mistral: Mistral | None        = None
         self._chat_sem = asyncio.Semaphore(CHAT_MAX_PARALLEL)
+        # facultatif pour les PDF Confluence
+        self.conf_pdf_dir = os.getenv("CONFLUENCE_PDF_DIR", None)
 
     @staticmethod
     def _distance_to_similarity(d: float) -> float:
@@ -358,12 +493,21 @@ class Pipeline:
 
     def _scan_docs(self) -> dict:
         out = {}
-        for root, _, files in os.walk(self.docs_dir, followlinks=True):
-            for fn in files:
-                ext = os.path.splitext(fn)[1].lower()
-                if ext in EXTENSIONS:
-                    path = os.path.join(root, fn)
-                    out[path] = os.path.getmtime(path)
+
+        # helper local, pas une méthode de classe
+        def _scan(dir_):
+            for root, _, files in os.walk(dir_, followlinks=True):
+                for fn in files:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in EXTENSIONS:
+                        path = os.path.join(root, fn)
+                        out[path] = os.path.getmtime(path)
+
+        # on lève deux scans depuis _scan_docs()
+        _scan(self.docs_dir)
+        if self.conf_pdf_dir:
+            _scan(self.conf_pdf_dir)
+
         return out
 
     async def _chat_stream_with_retry(
@@ -452,7 +596,23 @@ class Pipeline:
 
         # on mappe chaque extension sur son reader
         if ext == ".pdf":
+            # si c'est dans le dir Confluence PDF, on vérifie la référence JSON
+            if self.conf_pdf_dir and path.startswith(self.conf_pdf_dir):
+                # chercher le JSON parent via metadata
+                basename = os.path.basename(path)
+                # on suppose json fn <slug>_<id>.json et pdf fn identique
+                json_fn = basename.replace(".pdf", ".json")
+                json_path = os.path.join(self.docs_dir, json_fn)
+                if not os.path.exists(json_path):
+                    # PDF non référencé, on skip pour éviter doublon
+                    return []
             reader = PyMuPDFReader()
+        elif ext == ".json":
+            reader = ConfluenceJSONReader()
+            docs = await asyncio.to_thread(reader.load_data, path)
+            for d in docs:
+                d.metadata["file_path"] = path
+            return docs
         elif ext == ".docx":
             reader = DocxReader()
         elif ext == ".pptx":
@@ -476,8 +636,16 @@ class Pipeline:
                 asyncio.to_thread(reader.load_data, path),
                 timeout=120  # 2 minutes max par fichier
             )
+
+            ts_iso = datetime.fromtimestamp(
+                os.path.getmtime(path), tz=timezone.utc
+            ).isoformat()
+
             for doc in docs:
-                doc.metadata["file_path"] = path
+                meta = doc.metadata or {}
+                meta["file_path"] = path
+                meta.setdefault("last_modified", ts_iso)   # conserve la date JSON si présente
+                doc.metadata = meta
             logger.info(f"      ✅ OK {path}")
             return docs
 
@@ -492,6 +660,7 @@ class Pipeline:
     async def on_startup(self) -> None:
         logger.info("🚀 Démarrage pipeline RAG")
 
+        
         # ─── FORCE_INITIAL ────────────────────────────────────────────────────────
         force_initial = os.getenv("FORCE_INITIAL", "false").lower() in ("1", "true", "yes")
         if force_initial:
@@ -506,13 +675,35 @@ class Pipeline:
         logger.info(f"🔧 ThreadPoolExecutor(max_workers={MAX_LOADERS})")
 
         # 2) Mistral & embedding
-        self.mistral = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
-        Settings.embed_model = RetryingMistralEmbedding(
-            model_name="mistral-embed",
-            api_key=os.getenv("MISTRAL_API_KEY"),
-            temperature=0.7,
-            top_p=0.9,
-        )
+        if self.model == "local":
+            hf_name = os.getenv("LOCAL_EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
+            logger.info(f"⚙️  Utilisation de HuggingFaceEmbedding locale «{hf_name}»")
+            global EMBED_DIM
+
+            # ↘️ instancier et retenir dans une variable
+            embed_model = HuggingFaceEmbedding(
+                model_name=hf_name,
+                device="cpu",         # ou "cuda" si dispo
+                embed_batch_size=32,  # ajustable selon ta conf
+            )
+            Settings.embed_model = embed_model
+
+            # ↘️ récupérer la dimension
+            st = SentenceTransformer(hf_name, device="cpu")
+            dim = st.get_sentence_embedding_dimension()
+            logger.info(f"ℹ️  Embed dim détectée : {dim}")
+
+            # ↘️ mettre à jour la variable globale pour FAISS
+            EMBED_DIM = dim
+        else:
+            logger.info("⚙️  Utilisation de MistralAIEmbedding distant")
+            self.mistral = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+            Settings.embed_model = RetryingMistralEmbedding(
+                model_name="mistral-embed",
+                api_key=os.getenv("MISTRAL_API_KEY"),
+                temperature=0.7,
+                top_p=0.9,
+            )
         # 3) LLM synchrone : on construit MistralAI puis on le wrappe
         sync_mistral = MistralAI(
             model="mistral-large-latest",
@@ -795,16 +986,24 @@ Réponds à la question le plus précisément possible.
                 ),
                 streaming=True,
                 node_postprocessors=[
-                    SimilarityPostprocessor(similarity_cutoff=1.0 - SIM_THRESHOLD)
+                    SimilarityPostprocessor(similarity_cutoff=1.0 - SIM_THRESHOLD),
+                    TimeWeightedPostprocessor(
+                        time_decay=0.95,           # 0.0 = ignore l’âge ; 1.0 = ne regarde que la date
+                        top_k=BASE_TOP_K,
+                    ),
                 ],
             )
 
             # 3) Mémoire : conversion des messages dict → ChatMessage puis set()
             chat_history = [
-                ChatMessage(role=m["role"], content=m["content"])
+                ChatMessage(
+                    role=m["role"],
+                    content=_content_to_text(m.get("content", ""))
+                )
                 for m in messages
-                if m["role"] in {"user", "assistant"}         # on exclut les system existants
+                if m["role"] in {"user", "assistant"}
             ]
+
             memory = ChatMemoryBuffer(token_limit=4096)
             memory.set(chat_history)
 
@@ -819,10 +1018,19 @@ Réponds à la question le plus précisément possible.
                 verbose=False,
             )
 
+            domain_hint   = self.name
+            question_pref = f"{domain_hint}: {user_message}"
+
             # 5) Streaming réponse
-            resp = chat_engine.stream_chat(user_message)
+            resp = chat_engine.stream_chat(question_pref)
             for tok in resp.response_gen:
                 yield getattr(tok, "delta", tok)
+
+            # extraits + fichiers
+            if AFFICHAGE_SOURCES and resp.source_nodes:
+                yield "\n\n---\n### Extraits des sources\n"
+                yield _format_sources(resp.source_nodes)
+
 
             # 6) Section “Fichiers sources”
             files = _group_sources(resp.source_nodes)
