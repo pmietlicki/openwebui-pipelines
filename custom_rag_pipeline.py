@@ -608,11 +608,17 @@ class Pipeline:
                     return []
             reader = PyMuPDFReader()
         elif ext == ".json":
-            reader = ConfluenceJSONReader()
-            docs = await asyncio.to_thread(reader.load_data, path)
-            for d in docs:
-                d.metadata["file_path"] = path
-            return docs
+            # Essaie d'abord ConfluenceJSONReader, sinon bascule sur UnstructuredReader
+            try:
+                reader = ConfluenceJSONReader()
+                docs = await asyncio.to_thread(reader.load_data, path)
+                for d in docs:
+                    d.metadata["file_path"] = path
+                logger.info(f"      ✅ OK (ConfluenceJSONReader) {path}")
+                return docs
+            except Exception as e_json:
+                logger.warning(f"      ⚠️ ConfluenceJSONReader a échoué pour {path} : {e_json} — fallback UnstructuredReader")
+                reader = UnstructuredReader()
         elif ext == ".docx":
             reader = DocxReader()
         elif ext == ".pptx":
@@ -623,7 +629,26 @@ class Pipeline:
             # les trois formats Excel passent par Unstructured (tableaux)
             reader = UnstructuredReader()
         elif ext == ".html":
-            reader = HTMLTagReader()
+            try:
+                reader = HTMLTagReader()
+                docs = await asyncio.wait_for(
+                    asyncio.to_thread(reader.load_data, path),
+                    timeout=120
+                )
+                ts_iso = datetime.fromtimestamp(
+                    os.path.getmtime(path), tz=timezone.utc
+                ).isoformat()
+                for doc in docs:
+                    meta = doc.metadata or {}
+                    meta["file_path"] = path
+                    meta.setdefault("last_modified", ts_iso)
+                    doc.metadata = meta
+                logger.info(f"      ✅ OK (HTMLTagReader) {path}")
+                return docs
+
+            except Exception as e_html:
+                logger.warning(f"      ⚠️ HTMLTagReader a échoué pour {path} : {e_html} — fallback UnstructuredReader")
+                reader = UnstructuredReader()
         elif ext == ".md":
             reader = MarkdownReader()
         else:
@@ -954,8 +979,8 @@ class Pipeline:
             "En cas d'incertitude, demande des précisions à l'utilisateur."
             "Réponds en t'appuyant *principalement* sur le contexte."
             "Pour chaque point de ta réponse, fournis d’abord un extrait de 2–3 phrases."
-            "IMPORTANT : Réponds toujours dans la même langue que la requête."
-            "Si la requête est en français, TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN FRANÇAIS."
+            "IMPORTANT : Réponds toujours en français."
+            "TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN FRANÇAIS."
             "Si le contexte est illisible ou de mauvaise qualité, informe l'utilisateur."
             "Si l’information est incomplète, précise-le."
             "Si elle est absente, réponds « Je ne sais pas »."
@@ -986,7 +1011,6 @@ Réponds à la question le plus précisément possible.
                 ),
                 streaming=True,
                 node_postprocessors=[
-                    SimilarityPostprocessor(similarity_cutoff=1.0 - SIM_THRESHOLD),
                     TimeWeightedPostprocessor(
                         time_decay=0.95,           # 0.0 = ignore l’âge ; 1.0 = ne regarde que la date
                         top_k=BASE_TOP_K,
