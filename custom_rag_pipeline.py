@@ -5,6 +5,7 @@ import logging
 import asyncio
 import re
 import unicodedata
+import random
 from typing import List, Generator
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -119,7 +120,7 @@ logging.getLogger("llama_index").setLevel(logging.INFO)
 # ─── Concurrence & extensions autorisées ──────────────────────────────────────
 CPU_COUNT   = os.cpu_count() or 1
 EXTENSIONS  = {".pdf", ".json", ".docx", ".txt", ".md", ".html", ".csv", ".xlsx", ".xls", ".xlsm", ".pptx"}
-FILES_HOST = os.getenv("FILES_HOST", "https://sourcefiles.test.local")
+FILES_HOST = os.getenv("FILES_HOST", "https://files.pascal-mietlicki.fr")
 AFFICHAGE_SOURCES = os.getenv("AFFICHAGE_SOURCES", "false").lower() in ("1", "true", "yes")
 MAX_LOADERS = int(os.getenv("MAX_LOADERS", CPU_COUNT * 4))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
@@ -152,6 +153,61 @@ class ConfluenceJSONReader(BaseReader):
         text = f"{obj.get('title','')}\n\n{body}"
         return [Document(text=text, metadata=meta)]
 
+def _is_rate_limited(exc) -> tuple[bool, float]:
+    """
+    Détecte une 429 dans différents types d'exceptions (SDKError, httpx, generic).
+    Retourne (is_429, retry_after_seconds) où retry_after_seconds=0 si inconnu.
+    """
+    msg = str(exc) or ""
+    retry_after = 0.0
+
+    # Piste httpx
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            if getattr(resp, "status_code", None) == 429:
+                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                if ra:
+                    try: retry_after = float(ra)
+                    except: pass
+                return True, retry_after
+        except Exception:
+            pass
+
+    # Piste SDKError/status_code
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True, retry_after
+
+    # Piste message générique
+    if "429" in msg or "Too Many Requests" in msg:
+        # best-effort Retry-After via .response.headers si dispo
+        try:
+            hdrs = getattr(resp, "headers", None)
+            if hdrs:
+                ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                if ra:
+                    try: retry_after = float(ra)
+                    except: pass
+        except Exception:
+            pass
+        return True, retry_after
+
+    return False, 0.0
+
+def _sleep_with_backoff(attempt: int, base: float, explicit_wait: float|None=None, cap: float=30.0):
+    """
+    Dort explicitement le Retry-After si fourni, sinon backoff exponentiel + jitter.
+    """
+    if explicit_wait and explicit_wait > 0:
+        logger.warning(f"429 → attente Retry-After {explicit_wait:.2f}s (attempt={attempt+1})")
+        time.sleep(explicit_wait)
+        return
+    wait = min(base * (2 ** attempt), cap)
+    wait += random.uniform(0, 0.5)
+    logger.warning(f"429 → attente backoff {wait:.2f}s (attempt={attempt+1})")
+    time.sleep(wait)
+
 # ─── Embedding avec back-off ──────────────────────────────────────────────────
 class RetryingMistralEmbedding(MistralAIEmbedding):
     batch_size:    int   = Field(32,  description="Taille des sous-lots")
@@ -162,20 +218,18 @@ class RetryingMistralEmbedding(MistralAIEmbedding):
         for attempt in range(self.max_retries):
             try:
                 return func(*args)
-            except SDKError as e:
-                msg = str(e)
-                if "429" in msg:
-                    wait = self.retry_backoff * (2 ** attempt)
-                    logger.warning(f"429 reçu (requête), back-off de {wait}s…")
-                    time.sleep(wait)
+            except Exception as e:
+                is429, retry_after = _is_rate_limited(e)
+                if is429:
+                    _sleep_with_backoff(attempt, self.retry_backoff, retry_after)
                     continue
-                elif "Too many tokens" in msg and isinstance(args[0], list) and len(args[0]) > 1:
+                msg = str(e)
+                if "Too many tokens" in msg and isinstance(args[0], list) and len(args[0]) > 1:
                     mid = len(args[0]) // 2 or 1
                     left  = self._call_with_retry(func, args[0][:mid])
                     right = self._call_with_retry(func, args[0][mid:])
                     return left + right
-                else:
-                    raise
+                raise
         raise RuntimeError(f"Embeddings échoués après {self.max_retries} tentatives")
 
     def get_text_embedding_batch(self, texts: List[str], show_progress: bool = False, **kwargs) -> List[List[float]]:
@@ -224,13 +278,11 @@ class RetryingLLM(CustomLLM):
         kwargs.setdefault("max_tokens", MAX_TOKENS)
         for attempt in range(self.max_retries):
             try:
-                # appel synchrone à l’API complete
                 return self._inner_llm.complete(prompt, **kwargs)
-            except SDKError as e:
-                msg = str(e)
-                if "429" in msg and attempt < self.max_retries - 1:
-                    wait = self.backoff * (2 ** attempt)
-                    time.sleep(wait)
+            except Exception as e:
+                is429, retry_after = _is_rate_limited(e)
+                if is429 and attempt < self.max_retries - 1:
+                    _sleep_with_backoff(attempt, self.backoff, retry_after)
                     continue
                 raise
 
@@ -238,15 +290,14 @@ class RetryingLLM(CustomLLM):
         kwargs.setdefault("max_tokens", MAX_TOKENS)
         for attempt in range(self.max_retries):
             try:
-                # appel synchrone (bloquant) au stream_complete
                 return self._inner_llm.stream_complete(prompt, **kwargs)
-            except SDKError as e:
-                msg = str(e)
-                if "429" in msg and attempt < self.max_retries - 1:
-                    wait = self.backoff * (2 ** attempt)
-                    time.sleep(wait)
+            except Exception as e:
+                is429, retry_after = _is_rate_limited(e)
+                if is429 and attempt < self.max_retries - 1:
+                    _sleep_with_backoff(attempt, self.backoff, retry_after)
                     continue
                 raise
+                
     # 2) **méthodes publiques requises par CustomLLM**
     def complete(self, prompt: str, **kw) -> CompletionResponse:
         """Signature obligatoire – appelle la version protégée avec retry."""
@@ -408,26 +459,6 @@ def _content_to_text(content) -> str:
         return "\n".join(parts).strip()
     return str(content)
 
-def _content_to_text(content) -> str:
-    """
-    Convertit le champ 'content' OpenAI (str ou liste de blocs)
-    en texte brut exploitable par ChatMessage / Mistral.
-    - Les blocs textuels sont concaténés.
-    - Les images sont ignorées (ou remplacez-les par un placeholder).
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for blk in content:
-            if blk.get("type") == "text":
-                parts.append(blk.get("text", ""))
-            # Optionnel : garder une trace visuelle des images
-            # elif blk.get("type") == "image_url":
-            #     parts.append("[IMAGE]")
-        return "\n".join(parts).strip()
-    return str(content)
-
 
 class NoCondenseChatEngine(CondenseQuestionChatEngine):
     """Historique conservé, question transmise telle quelle (sync + async)."""
@@ -463,24 +494,24 @@ class Pipeline:
 
 
     def _retrieve_with_threshold(self, query: str):
-        """Ajout d’un retry sur l’embedding de requête (429)."""
         for attempt in range(CHAT_MAX_RETRIES):
             try:
                 k = BASE_TOP_K
+                last_results = []
                 while k <= MAX_TOP_K:
                     retriever = self.index.as_retriever(similarity_top_k=k)
                     results   = retriever.retrieve(query)
+                    last_results = results
                     if results:
                         best_sim = max(1.0 / (1.0 + r.score) for r in results)
                         if best_sim >= SIM_THRESHOLD:
                             return results
                     k += BASE_TOP_K
-                return results
-            except SDKError as e:
-                if "429" in str(e):
-                    wait = CHAT_BACKOFF * (2 ** attempt)
-                    logger.warning(f"429 rate-limit retrieve – back-off {wait}s…")
-                    time.sleep(wait)
+                return last_results
+            except Exception as e:
+                is429, retry_after = _is_rate_limited(e)
+                if is429:
+                    _sleep_with_backoff(attempt, CHAT_BACKOFF, retry_after)
                     continue
                 raise
         raise RuntimeError(f"Retrieval échoué après {CHAT_MAX_RETRIES} tentatives (rate-limit)")
@@ -529,10 +560,11 @@ class Pipeline:
                         top_p=top_p,
                         **kwargs,
                     )
-                except SDKError as e:
-                    if "429" in str(e):
-                        wait = CHAT_BACKOFF * (2 ** attempt)
-                        logger.warning(f"429 rate-limit – back-off {wait:.1f}s…")
+                except Exception as e:
+                    is429, retry_after = _is_rate_limited(e)
+                    if is429:
+                        wait = retry_after if retry_after else CHAT_BACKOFF * (2 ** attempt)
+                        logger.warning(f"429 ({type(e).__name__}) – attente {wait:.1f}s…")
                         await asyncio.sleep(wait)
                         continue
                     raise
