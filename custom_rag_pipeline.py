@@ -9,11 +9,13 @@ import random
 from typing import List, Generator
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from sentence_transformers import SentenceTransformer
 from functools import lru_cache
 from datetime import datetime, timezone
+
+import requests
 from bs4 import BeautifulSoup
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from sentence_transformers import SentenceTransformer
 
 title = os.getenv("PIPELINE_TITLE", "Custom RAG Pipeline")
 version = "1.0.0"
@@ -130,9 +132,12 @@ HNSW_EF_CONS    = int(os.getenv("HNSW_EF_CONS", "100"))
 HNSW_EF_SEARCH  = int(os.getenv("HNSW_EF_SEARCH", "64"))
 MIN_CHUNK_L     = int(os.getenv("MIN_CHUNK_LENGTH", "50"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
-LOADER_TIMEOUT  = int(os.getenv("LOADER_TIMEOUT", "120"))
-PDF_TIMEOUT     = int(os.getenv("PDF_TIMEOUT", "300"))
-FALLBACK_TIMEOUT = int(os.getenv("FALLBACK_TIMEOUT", str(max(PDF_TIMEOUT, 420))))
+LOADER_TIMEOUT  = int(os.getenv("LOADER_TIMEOUT", "180"))
+PDF_TIMEOUT     = int(os.getenv("PDF_TIMEOUT", "480"))
+FALLBACK_TIMEOUT = int(os.getenv("FALLBACK_TIMEOUT", str(max(PDF_TIMEOUT, 600))))
+ENABLE_TIKA_FALLBACK = os.getenv("ENABLE_TIKA_FALLBACK", "true").lower() in ("1", "true", "yes")
+TIKA_SERVER_URL = os.getenv("TIKA_SERVER_URL", "http://openwebui-tika:9998")
+TIKA_TIMEOUT = int(os.getenv("TIKA_TIMEOUT", "600"))
 
 CHAT_MAX_RETRIES   = int(os.getenv("CHAT_MAX_RETRIES", 5))
 CHAT_BACKOFF       = float(os.getenv("CHAT_BACKOFF", 1.0))
@@ -210,6 +215,51 @@ def _sleep_with_backoff(attempt: int, base: float, explicit_wait: float|None=Non
     wait += random.uniform(0, 0.5)
     logger.warning(f"429 → attente backoff {wait:.2f}s (attempt={attempt+1})")
     time.sleep(wait)
+
+
+def _tika_content_type(extension: str) -> str:
+    mapping = {
+        ".pdf": "application/pdf",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xls": "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".rtf": "application/rtf",
+        ".txt": "text/plain",
+    }
+    return mapping.get(extension.lower(), "application/octet-stream")
+
+
+def _tika_extract(path: str, extension: str) -> List[Document]:
+    if not ENABLE_TIKA_FALLBACK or not TIKA_SERVER_URL:
+        raise RuntimeError("Tika fallback désactivé")
+
+    url = f"{TIKA_SERVER_URL.rstrip('/')}/tika"
+    headers = {
+        "Accept": "text/plain; charset=utf-8",
+        "Content-Type": _tika_content_type(extension),
+    }
+    with open(path, "rb") as f:
+        resp = requests.put(url, data=f, headers=headers, timeout=TIKA_TIMEOUT)
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Tika retourne HTTP {resp.status_code}")
+
+    text = resp.text.strip()
+    if not text:
+        raise RuntimeError("Tika n'a renvoyé aucun contenu")
+
+    meta = {
+        "file_path": path,
+        "tika_fallback": True,
+        "content_type": headers["Content-Type"],
+    }
+    return [Document(text=text, metadata=meta)]
 
 # ─── Embedding avec back-off ──────────────────────────────────────────────────
 class RetryingMistralEmbedding(MistralAIEmbedding):
@@ -695,6 +745,22 @@ class Pipeline:
 
             except Exception as e:
                 logger.warning(f"      ⚠️ {label} a échoué pour {path} : {e} — tentative suivante")
+
+        # Tentative ultime via Tika (OCR / parsing robuste)
+        if ENABLE_TIKA_FALLBACK and ext in {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".xlsm", ".rtf", ".html", ".htm"}:
+            try:
+                docs = await asyncio.wait_for(
+                    asyncio.to_thread(_tika_extract, path, ext),
+                    timeout=TIKA_TIMEOUT,
+                )
+                for doc in docs:
+                    meta = doc.metadata or {}
+                    meta.setdefault("last_modified", ts_iso)
+                    doc.metadata = meta
+                logger.info(f"      ✅ OK {path} via Tika fallback")
+                return docs
+            except Exception as e:
+                logger.error(f"      ❌ Échec fallback Tika pour {path} : {e}")
 
         logger.error(f"      ❌ Toutes les tentatives de lecture ont échoué pour {path}")
         return []
