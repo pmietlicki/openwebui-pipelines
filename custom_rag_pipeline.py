@@ -130,6 +130,9 @@ HNSW_EF_CONS    = int(os.getenv("HNSW_EF_CONS", "100"))
 HNSW_EF_SEARCH  = int(os.getenv("HNSW_EF_SEARCH", "64"))
 MIN_CHUNK_L     = int(os.getenv("MIN_CHUNK_LENGTH", "50"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
+LOADER_TIMEOUT  = int(os.getenv("LOADER_TIMEOUT", "120"))
+PDF_TIMEOUT     = int(os.getenv("PDF_TIMEOUT", "300"))
+FALLBACK_TIMEOUT = int(os.getenv("FALLBACK_TIMEOUT", str(max(PDF_TIMEOUT, 420))))
 
 CHAT_MAX_RETRIES   = int(os.getenv("CHAT_MAX_RETRIES", 5))
 CHAT_BACKOFF       = float(os.getenv("CHAT_BACKOFF", 1.0))
@@ -626,93 +629,75 @@ class Pipeline:
         ext = os.path.splitext(path)[1].lower()
         logger.info(f"      ⏳ Charger {path}")
 
-        # on mappe chaque extension sur son reader
-        if ext == ".pdf":
-            # si c'est dans le dir Confluence PDF, on vérifie la référence JSON
-            if self.conf_pdf_dir and path.startswith(self.conf_pdf_dir):
-                # chercher le JSON parent via metadata
-                basename = os.path.basename(path)
-                # on suppose json fn <slug>_<id>.json et pdf fn identique
-                json_fn = basename.replace(".pdf", ".json")
-                json_path = os.path.join(self.docs_dir, json_fn)
-                if not os.path.exists(json_path):
-                    # PDF non référencé, on skip pour éviter doublon
-                    return []
-            reader = PyMuPDFReader()
-        elif ext == ".json":
-            # Essaie d'abord ConfluenceJSONReader, sinon bascule sur UnstructuredReader
+        # vérifie la cohérence JSON ↔ PDF pour Confluence
+        if ext == ".pdf" and self.conf_pdf_dir and path.startswith(self.conf_pdf_dir):
+            basename = os.path.basename(path)
+            json_fn = basename.replace(".pdf", ".json")
+            json_path = os.path.join(self.docs_dir, json_fn)
+            if not os.path.exists(json_path):
+                logger.warning(f"      ⚠️ PDF {path} ignoré car JSON associé introuvable ({json_path})")
+                return []
+
+        def _reader_attempts(extension: str):
+            if extension == ".pdf":
+                return [
+                    ("PyMuPDFReader", PyMuPDFReader, PDF_TIMEOUT),
+                    ("PDFReader", PDFReader, PDF_TIMEOUT),
+                    ("UnstructuredPDFReader", lambda: UnstructuredReader(), FALLBACK_TIMEOUT),
+                ]
+            if extension == ".json":
+                return [
+                    ("ConfluenceJSONReader", ConfluenceJSONReader, LOADER_TIMEOUT),
+                    ("UnstructuredJSONReader", lambda: UnstructuredReader(), FALLBACK_TIMEOUT),
+                ]
+            if extension == ".docx":
+                return [("DocxReader", DocxReader, LOADER_TIMEOUT)]
+            if extension == ".pptx":
+                return [("PptxReader", PptxReader, LOADER_TIMEOUT)]
+            if extension == ".csv":
+                return [("CSVReader", CSVReader, LOADER_TIMEOUT)]
+            if extension in {".xls", ".xlsx", ".xlsm"}:
+                return [("UnstructuredExcelReader", lambda: UnstructuredReader(), LOADER_TIMEOUT)]
+            if extension == ".html":
+                return [
+                    ("HTMLTagReader", HTMLTagReader, LOADER_TIMEOUT),
+                    ("UnstructuredHTMLReader", lambda: UnstructuredReader(), FALLBACK_TIMEOUT),
+                ]
+            if extension == ".md":
+                return [("MarkdownReader", MarkdownReader, LOADER_TIMEOUT)]
+            return [("FlatReader", FlatReader, LOADER_TIMEOUT)]
+
+        attempts = _reader_attempts(ext)
+        ts_iso = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).isoformat()
+
+        for label, factory, timeout in attempts:
             try:
-                reader = ConfluenceJSONReader()
-                docs = await asyncio.to_thread(reader.load_data, path)
-                for d in docs:
-                    d.metadata["file_path"] = path
-                logger.info(f"      ✅ OK (ConfluenceJSONReader) {path}")
-                return docs
-            except Exception as e_json:
-                logger.warning(f"      ⚠️ ConfluenceJSONReader a échoué pour {path} : {e_json} — fallback UnstructuredReader")
-                reader = UnstructuredReader()
-        elif ext == ".docx":
-            reader = DocxReader()
-        elif ext == ".pptx":
-            reader = PptxReader()
-        elif ext == ".csv":
-            reader = CSVReader()
-        elif ext in {".xls", ".xlsx", ".xlsm"}:
-            # les trois formats Excel passent par Unstructured (tableaux)
-            reader = UnstructuredReader()
-        elif ext == ".html":
-            try:
-                reader = HTMLTagReader()
+                reader = factory() if callable(factory) else factory
                 docs = await asyncio.wait_for(
                     asyncio.to_thread(reader.load_data, path),
-                    timeout=120
+                    timeout=timeout,
                 )
-                ts_iso = datetime.fromtimestamp(
-                    os.path.getmtime(path), tz=timezone.utc
-                ).isoformat()
+                if not docs:
+                    logger.warning(f"      ⚠️ {label} a renvoyé 0 document pour {path}")
+                    continue
+
                 for doc in docs:
                     meta = doc.metadata or {}
                     meta["file_path"] = path
                     meta.setdefault("last_modified", ts_iso)
                     doc.metadata = meta
-                logger.info(f"      ✅ OK (HTMLTagReader) {path}")
+
+                logger.info(f"      ✅ OK {path} via {label}")
                 return docs
 
-            except Exception as e_html:
-                logger.warning(f"      ⚠️ HTMLTagReader a échoué pour {path} : {e_html} — fallback UnstructuredReader")
-                reader = UnstructuredReader()
-        elif ext == ".md":
-            reader = MarkdownReader()
-        else:
-            # txt, rtf, hwp, xml, etc.
-            reader = FlatReader()
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ Timeout ({timeout}s) sur {path} avec {label}")
 
-        try:
-            # on passe TOUJOURS une liste de chemins, en thread, avec timeout
-            docs = await asyncio.wait_for(
-                asyncio.to_thread(reader.load_data, path),
-                timeout=120  # 2 minutes max par fichier
-            )
+            except Exception as e:
+                logger.warning(f"      ⚠️ {label} a échoué pour {path} : {e} — tentative suivante")
 
-            ts_iso = datetime.fromtimestamp(
-                os.path.getmtime(path), tz=timezone.utc
-            ).isoformat()
-
-            for doc in docs:
-                meta = doc.metadata or {}
-                meta["file_path"] = path
-                meta.setdefault("last_modified", ts_iso)   # conserve la date JSON si présente
-                doc.metadata = meta
-            logger.info(f"      ✅ OK {path}")
-            return docs
-
-        except asyncio.TimeoutError:
-            logger.error(f"⏰ Timeout sur {path}")
-            return []
-
-        except Exception as e:
-            logger.error(f"      ❌ Échec {path} : {e}")
-            return []
+        logger.error(f"      ❌ Toutes les tentatives de lecture ont échoué pour {path}")
+        return []
 
     async def on_startup(self) -> None:
         logger.info("🚀 Démarrage pipeline RAG")
